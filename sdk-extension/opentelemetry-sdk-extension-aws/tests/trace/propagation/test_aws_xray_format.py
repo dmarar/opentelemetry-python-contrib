@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import unittest
+from unittest.mock import Mock, patch
 
 from requests.structures import CaseInsensitiveDict
 
@@ -138,7 +139,9 @@ class AwsXRayPropagatorTest(unittest.TestCase):
         AwsXRayPropagatorTest.XRAY_PROPAGATOR.inject(
             AwsXRayPropagatorTest.carrier_setter,
             carrier,
-            build_test_current_context(trace_state=TraceState({"foo": "bar"})),
+            build_test_current_context(
+                trace_state=TraceState([("foo", "bar")])
+            ),
         )
 
         # TODO: (NathanielRN) Assert trace state when the propagator supports it
@@ -152,6 +155,21 @@ class AwsXRayPropagatorTest(unittest.TestCase):
         )
 
         self.assertEqual(injected_items, expected_items)
+
+    def test_inject_reported_fields_matches_carrier_fields(self):
+        carrier = CaseInsensitiveDict()
+
+        AwsXRayPropagatorTest.XRAY_PROPAGATOR.inject(
+            AwsXRayPropagatorTest.carrier_setter,
+            carrier,
+            build_test_current_context(),
+        )
+
+        injected_keys = set(carrier.keys())
+
+        self.assertEqual(
+            injected_keys, AwsXRayPropagatorTest.XRAY_PROPAGATOR.fields
+        )
 
     # Extract Tests
 
@@ -356,4 +374,36 @@ class AwsXRayPropagatorTest(unittest.TestCase):
         self.assertEqual(
             get_nested_span_context(context_with_extracted),
             INVALID_SPAN_CONTEXT,
+        )
+
+    @patch(
+        "opentelemetry.sdk.extension.aws.trace."
+        "propagation.aws_xray_format.trace"
+    )
+    def test_fields(self, mock_trace):
+        """Make sure the fields attribute returns the fields used in inject"""
+
+        mock_trace.configure_mock(
+            **{
+                "get_current_span.return_value": Mock(
+                    **{
+                        "get_span_context.return_value": Mock(
+                            **{"is_valid": True, "trace_id": 1, "span_id": 1}
+                        )
+                    }
+                )
+            }
+        )
+
+        mock_set_in_carrier = Mock()
+
+        AwsXRayPropagatorTest.XRAY_PROPAGATOR.inject(mock_set_in_carrier, {})
+
+        inject_fields = set()
+
+        for call in mock_set_in_carrier.mock_calls:
+            inject_fields.add(call[1][1])
+
+        self.assertEqual(
+            AwsXRayPropagatorTest.XRAY_PROPAGATOR.fields, inject_fields
         )

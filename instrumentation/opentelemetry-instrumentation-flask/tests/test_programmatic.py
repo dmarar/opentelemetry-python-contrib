@@ -20,7 +20,7 @@ from opentelemetry import trace
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.test.test_base import TestBase
 from opentelemetry.test.wsgitestutil import WsgiTestBase
-from opentelemetry.util import ExcludeList
+from opentelemetry.util.http import get_excluded_urls
 
 # pylint: disable=import-error
 from .base_test import InstrumentationTest
@@ -28,11 +28,10 @@ from .base_test import InstrumentationTest
 
 def expected_attributes(override_attributes):
     default_attributes = {
-        "component": "http",
         "http.method": "GET",
         "http.server_name": "localhost",
         "http.scheme": "http",
-        "host.port": 80,
+        "net.host.port": 80,
         "http.host": "localhost",
         "http.target": "/",
         "http.flavor": "1.1",
@@ -54,8 +53,23 @@ class TestProgrammatic(InstrumentationTest, TestBase, WsgiTestBase):
 
         self._common_initialization()
 
+        self.env_patch = patch.dict(
+            "os.environ",
+            {
+                "OTEL_PYTHON_FLASK_EXCLUDED_URLS": "http://localhost/excluded_arg/123,excluded_noarg"
+            },
+        )
+        self.env_patch.start()
+        self.exclude_patch = patch(
+            "opentelemetry.instrumentation.flask._excluded_urls",
+            get_excluded_urls("FLASK"),
+        )
+        self.exclude_patch.start()
+
     def tearDown(self):
         super().tearDown()
+        self.env_patch.stop()
+        self.exclude_patch.stop()
         with self.disable_logging():
             FlaskInstrumentor().uninstrument_app(self.app)
 
@@ -158,10 +172,6 @@ class TestProgrammatic(InstrumentationTest, TestBase, WsgiTestBase):
         self.assertEqual(span_list[0].kind, trace.SpanKind.SERVER)
         self.assertEqual(span_list[0].attributes, expected_attrs)
 
-    @patch(
-        "opentelemetry.instrumentation.flask._excluded_urls",
-        ExcludeList(["http://localhost/excluded_arg/123", "excluded_noarg"]),
-    )
     def test_exclude_lists(self):
         self.client.get("/excluded_arg/123")
         span_list = self.memory_exporter.get_finished_spans()

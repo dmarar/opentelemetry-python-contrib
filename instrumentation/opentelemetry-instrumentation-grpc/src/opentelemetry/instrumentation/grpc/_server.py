@@ -26,8 +26,9 @@ from contextlib import contextmanager
 
 import grpc
 
-from opentelemetry import propagators, trace
+from opentelemetry import trace
 from opentelemetry.context import attach, detach
+from opentelemetry.propagate import extract
 from opentelemetry.trace.propagation.textmap import DictGetter
 from opentelemetry.trace.status import Status, StatusCode
 
@@ -113,9 +114,12 @@ class _OpenTelemetryServicerContext(grpc.ServicerContext):
     def abort(self, code, details):
         self.code = code
         self.details = details
-        self._active_span.set_attribute("rpc.grpc.status_code", code.name)
+        self._active_span.set_attribute("rpc.grpc.status_code", code.value[0])
         self._active_span.set_status(
-            Status(status_code=StatusCode.ERROR, description=details)
+            Status(
+                status_code=StatusCode.ERROR,
+                description="{}:{}".format(code, details),
+            )
         )
         return self._servicer_context.abort(code, details)
 
@@ -126,17 +130,25 @@ class _OpenTelemetryServicerContext(grpc.ServicerContext):
         self.code = code
         # use details if we already have it, otherwise the status description
         details = self.details or code.value[1]
-        self._active_span.set_attribute("rpc.grpc.status_code", code.name)
-        self._active_span.set_status(
-            Status(status_code=StatusCode.ERROR, description=details)
-        )
+        self._active_span.set_attribute("rpc.grpc.status_code", code.value[0])
+        if code != grpc.StatusCode.OK:
+            self._active_span.set_status(
+                Status(
+                    status_code=StatusCode.ERROR,
+                    description="{}:{}".format(code, details),
+                )
+            )
         return self._servicer_context.set_code(code)
 
     def set_details(self, details):
         self.details = details
-        self._active_span.set_status(
-            Status(status_code=StatusCode.ERROR, description=details)
-        )
+        if self.code != grpc.StatusCode.OK:
+            self._active_span.set_status(
+                Status(
+                    status_code=StatusCode.ERROR,
+                    description="{}:{}".format(self.code, details),
+                )
+            )
         return self._servicer_context.set_details(details)
 
 
@@ -170,7 +182,7 @@ class OpenTelemetryServerInterceptor(grpc.ServerInterceptor):
         metadata = servicer_context.invocation_metadata()
         if metadata:
             md_dict = {md.key: md.value for md in metadata}
-            ctx = propagators.extract(self._carrier_getter, md_dict)
+            ctx = extract(self._carrier_getter, md_dict)
             token = attach(ctx)
             try:
                 yield
@@ -181,12 +193,20 @@ class OpenTelemetryServerInterceptor(grpc.ServerInterceptor):
 
     def _start_span(self, handler_call_details, context):
 
+        # standard attributes
         attributes = {
-            "rpc.method": handler_call_details.method,
             "rpc.system": "grpc",
-            "rpc.grpc.status_code": grpc.StatusCode.OK,
+            "rpc.grpc.status_code": grpc.StatusCode.OK.value[0],
         }
 
+        # if we have details about the call, split into service and method
+        if handler_call_details.method:
+            service, method = handler_call_details.method.lstrip("/").split(
+                "/", 1
+            )
+            attributes.update({"rpc.method": method, "rpc.service": service})
+
+        # add some attributes from the metadata
         metadata = dict(context.invocation_metadata())
         if "user-agent" in metadata:
             attributes["rpc.user_agent"] = metadata["user-agent"]
@@ -198,15 +218,15 @@ class OpenTelemetryServerInterceptor(grpc.ServerInterceptor):
         # * ipv4:10.2.1.1:57284,127.0.0.1:57284
         #
         try:
-            host, port = (
+            ip, port = (
                 context.peer().split(",")[0].split(":", 1)[1].rsplit(":", 1)
             )
+            attributes.update({"net.peer.ip": ip, "net.peer.port": port})
 
-            # other telemetry sources convert this, so we will too
-            if host in ("[::1]", "127.0.0.1"):
-                host = "localhost"
+            # other telemetry sources add this, so we will too
+            if ip in ("[::1]", "127.0.0.1"):
+                attributes["net.peer.name"] = "localhost"
 
-            attributes.update({"net.peer.name": host, "net.peer.port": port})
         except IndexError:
             logger.warning("Failed to parse peer address '%s'", context.peer())
 
@@ -220,6 +240,15 @@ class OpenTelemetryServerInterceptor(grpc.ServerInterceptor):
         def telemetry_wrapper(behavior, request_streaming, response_streaming):
             def telemetry_interceptor(request_or_iterator, context):
 
+                # handle streaming responses specially
+                if response_streaming:
+                    return self._intercept_server_stream(
+                        behavior,
+                        handler_call_details,
+                        request_or_iterator,
+                        context,
+                    )
+
                 with self._set_remote_context(context):
                     with self._start_span(
                         handler_call_details, context
@@ -230,6 +259,7 @@ class OpenTelemetryServerInterceptor(grpc.ServerInterceptor):
                         # And now we run the actual RPC.
                         try:
                             return behavior(request_or_iterator, context)
+
                         except Exception as error:
                             # Bare exceptions are likely to be gRPC aborts, which
                             # we handle in our context wrapper.
@@ -244,3 +274,23 @@ class OpenTelemetryServerInterceptor(grpc.ServerInterceptor):
         return _wrap_rpc_behavior(
             continuation(handler_call_details), telemetry_wrapper
         )
+
+    # Handle streaming responses separately - we have to do this
+    # to return a *new* generator or various upstream things
+    # get confused, or we'll lose the consistent trace
+    def _intercept_server_stream(
+        self, behavior, handler_call_details, request_or_iterator, context
+    ):
+
+        with self._set_remote_context(context):
+            with self._start_span(handler_call_details, context) as span:
+                context = _OpenTelemetryServicerContext(context, span)
+
+                try:
+                    yield from behavior(request_or_iterator, context)
+
+                except Exception as error:
+                    # pylint:disable=unidiomatic-typecheck
+                    if type(error) != Exception:
+                        span.record_exception(error)
+                    raise error

@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 from ddtrace.internal.writer import AgentWriter
+from flaky import flaky
 
 from opentelemetry import trace as trace_api
 from opentelemetry.context import Context
@@ -483,6 +484,7 @@ class TestDatadogSpanExporter(unittest.TestCase):
 
         tracer_provider.shutdown()
 
+    @flaky(max_runs=3, min_passes=1)
     def test_batch_span_processor_reset_timeout(self):
         """Test that the scheduled timeout is reset on cycles without spans"""
         delay = 50
@@ -540,7 +542,7 @@ class TestDatadogSpanExporter(unittest.TestCase):
             span_id=trace_api.INVALID_SPAN,
             is_remote=True,
             trace_state=trace_api.TraceState(
-                {datadog.constants.DD_ORIGIN: "origin-service"}
+                [(datadog.constants.DD_ORIGIN, "origin-service")]
             ),
         )
 
@@ -578,11 +580,11 @@ class TestDatadogSpanExporter(unittest.TestCase):
             is_remote=False,
             trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
         )
-        sampler = sampling.TraceIdRatioBased(0.5)
-
-        span = trace._Span(
-            name="sampled", context=context, parent=None, sampler=sampler
+        trace_api.get_tracer_provider().sampler = sampling.TraceIdRatioBased(
+            0.5
         )
+
+        span = trace._Span(name="sampled", context=context, parent=None)
         span.start()
         span.end()
 

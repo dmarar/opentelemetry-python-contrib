@@ -22,7 +22,7 @@ from opentelemetry import trace as trace_api
 from opentelemetry.instrumentation.aiopg import AiopgInstrumentor
 from opentelemetry.test.test_base import TestBase
 
-POSTGRES_HOST = os.getenv("POSTGRESQL_HOST", "localhost")
+POSTGRES_HOST = os.getenv("POSTGRESQL_HOST", "127.0.0.1")
 POSTGRES_PORT = int(os.getenv("POSTGRESQL_PORT", "5432"))
 POSTGRES_DB_NAME = os.getenv("POSTGRESQL_DB_NAME", "opentelemetry-tests")
 POSTGRES_PASSWORD = os.getenv("POSTGRESQL_PASSWORD", "testpassword")
@@ -89,7 +89,7 @@ class TestFunctionalAiopgConnect(TestBase):
         stmt = "CREATE TABLE IF NOT EXISTS test (id integer)"
         with self._tracer.start_as_current_span("rootSpan"):
             async_call(self._cursor.execute(stmt))
-        self.validate_spans(stmt)
+        self.validate_spans("CREATE")
 
     def test_executemany(self):
         """Should create a child span for executemany"""
@@ -98,7 +98,7 @@ class TestFunctionalAiopgConnect(TestBase):
             with self._tracer.start_as_current_span("rootSpan"):
                 data = (("1",), ("2",), ("3",))
                 async_call(self._cursor.executemany(stmt, data))
-            self.validate_spans(stmt)
+            self.validate_spans("INSERT")
 
     def test_callproc(self):
         """Should create a child span for callproc"""
@@ -167,7 +167,7 @@ class TestFunctionalAiopgCreatePool(TestBase):
         stmt = "CREATE TABLE IF NOT EXISTS test (id integer)"
         with self._tracer.start_as_current_span("rootSpan"):
             async_call(self._cursor.execute(stmt))
-        self.validate_spans(stmt)
+        self.validate_spans("CREATE")
 
     def test_executemany(self):
         """Should create a child span for executemany"""
@@ -176,7 +176,7 @@ class TestFunctionalAiopgCreatePool(TestBase):
             with self._tracer.start_as_current_span("rootSpan"):
                 data = (("1",), ("2",), ("3",))
                 async_call(self._cursor.executemany(stmt, data))
-            self.validate_spans(stmt)
+            self.validate_spans("INSERT")
 
     def test_callproc(self):
         """Should create a child span for callproc"""

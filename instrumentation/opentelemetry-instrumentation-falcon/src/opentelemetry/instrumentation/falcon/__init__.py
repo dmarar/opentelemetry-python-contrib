@@ -43,22 +43,23 @@ API
 ---
 """
 
-import sys
 from logging import getLogger
+from sys import exc_info
 
 import falcon
 
 import opentelemetry.instrumentation.wsgi as otel_wsgi
-from opentelemetry import configuration, context, propagators, trace
-from opentelemetry.configuration import Configuration
+from opentelemetry import context, trace
 from opentelemetry.instrumentation.falcon.version import __version__
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.utils import (
     extract_attributes_from_object,
     http_status_to_status_code,
 )
+from opentelemetry.propagate import extract
 from opentelemetry.trace.status import Status
-from opentelemetry.util import ExcludeList, time_ns
+from opentelemetry.util.http import get_excluded_urls, get_traced_request_attrs
+from opentelemetry.util.providers import time_ns
 
 _logger = getLogger(__name__)
 
@@ -69,14 +70,8 @@ _ENVIRON_TOKEN = "opentelemetry-falcon.token"
 _ENVIRON_EXC = "opentelemetry-falcon.exc"
 
 
-def get_excluded_urls():
-    urls = configuration.Configuration().FALCON_EXCLUDED_URLS or ""
-    if urls:
-        urls = str.split(urls, ",")
-    return ExcludeList(urls)
-
-
-_excluded_urls = get_excluded_urls()
+_excluded_urls = get_excluded_urls("FALCON")
+_traced_request_attrs = get_traced_request_attrs("FALCON")
 
 
 class FalconInstrumentor(BaseInstrumentor):
@@ -114,9 +109,7 @@ class _InstrumentedFalconAPI(falcon.API):
 
         start_time = time_ns()
 
-        token = context.attach(
-            propagators.extract(otel_wsgi.carrier_getter, env)
-        )
+        token = context.attach(extract(otel_wsgi.carrier_getter, env))
         span = self._tracer.start_span(
             otel_wsgi.get_default_span_name(env),
             kind=trace.SpanKind.SERVER,
@@ -156,12 +149,7 @@ class _TraceMiddleware:
 
     def __init__(self, tracer=None, traced_request_attrs=None):
         self.tracer = tracer
-        self._traced_request_attrs = traced_request_attrs or [
-            attr.strip()
-            for attr in (
-                Configuration().FALCON_TRACED_REQUEST_ATTRS or ""
-            ).split(",")
-        ]
+        self._traced_request_attrs = _traced_request_attrs
 
     def process_request(self, req, resp):
         span = req.env.get(_ENVIRON_SPAN_KEY)
@@ -198,7 +186,7 @@ class _TraceMiddleware:
             status = "404"
             reason = "NotFound"
 
-        exc_type, exc, _ = sys.exc_info()
+        exc_type, exc, _ = exc_info()
         if exc_type and not req_succeeded:
             if "HTTPNotFound" in exc_type.__name__:
                 status = "404"
