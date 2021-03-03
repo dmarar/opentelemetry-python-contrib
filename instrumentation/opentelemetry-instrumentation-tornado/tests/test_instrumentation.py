@@ -25,7 +25,7 @@ from opentelemetry.instrumentation.tornado import (
 )
 from opentelemetry.test.test_base import TestBase
 from opentelemetry.trace import SpanKind
-from opentelemetry.util import ExcludeList
+from opentelemetry.util.http import get_excluded_urls, get_traced_request_attrs
 
 from .tornado_test_app import (
     AsyncHandler,
@@ -44,9 +44,31 @@ class TornadoTest(AsyncHTTPTestCase, TestBase):
     def setUp(self):
         TornadoInstrumentor().instrument()
         super().setUp()
+        # pylint: disable=protected-access
+        self.env_patch = patch.dict(
+            "os.environ",
+            {
+                "OTEL_PYTHON_TORNADO_EXCLUDED_URLS": "healthz,ping",
+                "OTEL_PYTHON_TORNADO_TRACED_REQUEST_ATTRS": "uri,full_url,query",
+            },
+        )
+        self.env_patch.start()
+        self.exclude_patch = patch(
+            "opentelemetry.instrumentation.tornado._excluded_urls",
+            get_excluded_urls("TORNADO"),
+        )
+        self.traced_patch = patch(
+            "opentelemetry.instrumentation.tornado._traced_request_attrs",
+            get_traced_request_attrs("TORNADO"),
+        )
+        self.exclude_patch.start()
+        self.traced_patch.start()
 
     def tearDown(self):
         TornadoInstrumentor().uninstrument()
+        self.env_patch.stop()
+        self.exclude_patch.stop()
+        self.traced_patch.stop()
         super().tearDown()
 
 
@@ -105,7 +127,6 @@ class TestTornadoInstrumentation(TornadoTest):
         self.assert_span_has_attributes(
             server,
             {
-                "component": "tornado",
                 "http.method": method,
                 "http.scheme": "http",
                 "http.host": "127.0.0.1:" + str(self.get_http_port()),
@@ -123,7 +144,6 @@ class TestTornadoInstrumentation(TornadoTest):
         self.assert_span_has_attributes(
             client,
             {
-                "component": "tornado",
                 "http.url": self.get_url("/"),
                 "http.method": method,
                 "http.status_code": 201,
@@ -182,7 +202,6 @@ class TestTornadoInstrumentation(TornadoTest):
         self.assert_span_has_attributes(
             server,
             {
-                "component": "tornado",
                 "http.method": "GET",
                 "http.scheme": "http",
                 "http.host": "127.0.0.1:" + str(self.get_http_port()),
@@ -200,7 +219,6 @@ class TestTornadoInstrumentation(TornadoTest):
         self.assert_span_has_attributes(
             client,
             {
-                "component": "tornado",
                 "http.url": self.get_url(url),
                 "http.method": "GET",
                 "http.status_code": 201,
@@ -220,7 +238,6 @@ class TestTornadoInstrumentation(TornadoTest):
         self.assert_span_has_attributes(
             server,
             {
-                "component": "tornado",
                 "http.method": "GET",
                 "http.scheme": "http",
                 "http.host": "127.0.0.1:" + str(self.get_http_port()),
@@ -235,7 +252,6 @@ class TestTornadoInstrumentation(TornadoTest):
         self.assert_span_has_attributes(
             client,
             {
-                "component": "tornado",
                 "http.url": self.get_url("/error"),
                 "http.method": "GET",
                 "http.status_code": 500,
@@ -255,7 +271,6 @@ class TestTornadoInstrumentation(TornadoTest):
         self.assert_span_has_attributes(
             server,
             {
-                "component": "tornado",
                 "http.method": "GET",
                 "http.scheme": "http",
                 "http.host": "127.0.0.1:" + str(self.get_http_port()),
@@ -271,7 +286,6 @@ class TestTornadoInstrumentation(TornadoTest):
         self.assert_span_has_attributes(
             client,
             {
-                "component": "tornado",
                 "http.url": self.get_url("/missing-url"),
                 "http.method": "GET",
                 "http.status_code": 404,
@@ -301,7 +315,6 @@ class TestTornadoInstrumentation(TornadoTest):
         self.assert_span_has_attributes(
             server,
             {
-                "component": "tornado",
                 "http.method": "GET",
                 "http.scheme": "http",
                 "http.host": "127.0.0.1:" + str(self.get_http_port()),
@@ -319,17 +332,12 @@ class TestTornadoInstrumentation(TornadoTest):
         self.assert_span_has_attributes(
             client,
             {
-                "component": "tornado",
                 "http.url": self.get_url("/dyna"),
                 "http.method": "GET",
                 "http.status_code": 202,
             },
         )
 
-    @patch(
-        "opentelemetry.instrumentation.tornado._excluded_urls",
-        ExcludeList(["healthz", "ping"]),
-    )
     def test_exclude_lists(self):
         def test_excluded(path):
             self.fetch(path)
@@ -343,7 +351,6 @@ class TestTornadoInstrumentation(TornadoTest):
             self.assert_span_has_attributes(
                 client,
                 {
-                    "component": "tornado",
                     "http.url": self.get_url(path),
                     "http.method": "GET",
                     "http.status_code": 200,
@@ -354,18 +361,14 @@ class TestTornadoInstrumentation(TornadoTest):
         test_excluded("/healthz")
         test_excluded("/ping")
 
-    @patch(
-        "opentelemetry.instrumentation.tornado._traced_attrs",
-        ["uri", "full_url", "query"],
-    )
     def test_traced_attrs(self):
-        self.fetch("/ping?q=abc&b=123")
+        self.fetch("/pong?q=abc&b=123")
         spans = self.sorted_spans(self.memory_exporter.get_finished_spans())
         self.assertEqual(len(spans), 2)
         server_span = spans[0]
         self.assertEqual(server_span.kind, SpanKind.SERVER)
         self.assert_span_has_attributes(
-            server_span, {"uri": "/ping?q=abc&b=123", "query": "q=abc&b=123"}
+            server_span, {"uri": "/pong?q=abc&b=123", "query": "q=abc&b=123"}
         )
         self.memory_exporter.clear()
 

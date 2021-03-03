@@ -6,9 +6,11 @@ from pyramid.settings import asbool
 from pyramid.tweens import EXCVIEW
 
 import opentelemetry.instrumentation.wsgi as otel_wsgi
-from opentelemetry import configuration, context, propagators, trace
+from opentelemetry import context, trace
 from opentelemetry.instrumentation.pyramid.version import __version__
-from opentelemetry.util import ExcludeList, time_ns
+from opentelemetry.propagate import extract
+from opentelemetry.util.http import get_excluded_urls
+from opentelemetry.util.time import time_ns
 
 TWEEN_NAME = "opentelemetry.instrumentation.pyramid.trace_tween_factory"
 SETTING_TRACE_ENABLED = "opentelemetry-pyramid.trace_enabled"
@@ -22,14 +24,7 @@ _ENVIRON_TOKEN = "opentelemetry-pyramid.token"
 _logger = getLogger(__name__)
 
 
-def get_excluded_urls():
-    urls = configuration.Configuration().PYRAMID_EXCLUDED_URLS or []
-    if urls:
-        urls = str.split(urls, ",")
-    return ExcludeList(urls)
-
-
-_excluded_urls = get_excluded_urls()
+_excluded_urls = get_excluded_urls("PYRAMID")
 
 
 def includeme(config):
@@ -51,10 +46,10 @@ def _insert_tween(config):
 
 def _before_traversal(event):
     request = event.request
-    environ = request.environ
-    span_name = otel_wsgi.get_default_span_name(environ)
+    request_environ = request.environ
+    span_name = otel_wsgi.get_default_span_name(request_environ)
 
-    enabled = environ.get(_ENVIRON_ENABLED_KEY)
+    enabled = request_environ.get(_ENVIRON_ENABLED_KEY)
     if enabled is None:
         _logger.warning(
             "Opentelemetry pyramid tween 'opentelemetry.instrumentation.pyramid.trace_tween_factory'"
@@ -67,24 +62,22 @@ def _before_traversal(event):
         # Tracing not enabled, return
         return
 
-    start_time = environ.get(_ENVIRON_STARTTIME_KEY)
+    start_time = request_environ.get(_ENVIRON_STARTTIME_KEY)
 
-    token = context.attach(
-        propagators.extract(otel_wsgi.carrier_getter, environ)
-    )
+    token = context.attach(extract(otel_wsgi.carrier_getter, request_environ))
     tracer = trace.get_tracer(__name__, __version__)
 
     if request.matched_route:
         span_name = request.matched_route.pattern
     else:
-        span_name = otel_wsgi.get_default_span_name(environ)
+        span_name = otel_wsgi.get_default_span_name(request_environ)
 
     span = tracer.start_span(
         span_name, kind=trace.SpanKind.SERVER, start_time=start_time,
     )
 
     if span.is_recording():
-        attributes = otel_wsgi.collect_request_attributes(environ)
+        attributes = otel_wsgi.collect_request_attributes(request_environ)
         if request.matched_route:
             attributes["http.route"] = request.matched_route.pattern
         for key, value in attributes.items():
@@ -92,9 +85,9 @@ def _before_traversal(event):
 
     activation = tracer.use_span(span, end_on_exit=True)
     activation.__enter__()
-    environ[_ENVIRON_ACTIVATION_KEY] = activation
-    environ[_ENVIRON_SPAN_KEY] = span
-    environ[_ENVIRON_TOKEN] = token
+    request_environ[_ENVIRON_ACTIVATION_KEY] = activation
+    request_environ[_ENVIRON_SPAN_KEY] = span
+    request_environ[_ENVIRON_TOKEN] = token
 
 
 def trace_tween_factory(handler, registry):

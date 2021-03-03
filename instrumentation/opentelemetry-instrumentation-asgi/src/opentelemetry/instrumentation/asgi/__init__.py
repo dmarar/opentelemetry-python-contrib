@@ -18,7 +18,6 @@ on any ASGI framework (such as Django-channels / Quart) to track requests
 timing through OpenTelemetry.
 """
 
-import operator
 import typing
 import urllib
 from functools import wraps
@@ -26,15 +25,18 @@ from typing import Tuple
 
 from asgiref.compatibility import guarantee_single_callable
 
-from opentelemetry import context, propagators, trace
+from opentelemetry import context, trace
 from opentelemetry.instrumentation.asgi.version import __version__  # noqa
 from opentelemetry.instrumentation.utils import http_status_to_status_code
-from opentelemetry.trace.propagation.textmap import DictGetter
+from opentelemetry.propagate import extract
+from opentelemetry.propagators.textmap import DictGetter
 from opentelemetry.trace.status import Status, StatusCode
 
 
 class CarrierGetter(DictGetter):
-    def get(self, carrier: dict, key: str) -> typing.List[str]:
+    def get(
+        self, carrier: dict, key: str
+    ) -> typing.Optional[typing.List[str]]:
         """Getter implementation to retrieve a HTTP header value from the ASGI
         scope.
 
@@ -43,14 +45,22 @@ class CarrierGetter(DictGetter):
             key: header name in scope
         Returns:
             A list with a single string with the header value if it exists,
-             else an empty list.
+                else None.
         """
         headers = carrier.get("headers")
-        return [
+        if not headers:
+            return None
+
+        # asgi header keys are in lower case
+        key = key.lower()
+        decoded = [
             _value.decode("utf8")
             for (_key, _value) in headers
             if _key.decode("utf8") == key
         ]
+        if not decoded:
+            return None
+        return decoded
 
 
 carrier_getter = CarrierGetter()
@@ -59,11 +69,7 @@ carrier_getter = CarrierGetter()
 def collect_request_attributes(scope):
     """Collects HTTP request attributes from the ASGI scope and returns a
     dictionary to be used as span creation attributes."""
-    server = scope.get("server") or ["0.0.0.0", 80]
-    port = server[1]
-    server_host = server[0] + (":" + str(port) if port != 80 else "")
-    full_path = scope.get("root_path", "") + scope.get("path", "")
-    http_url = scope.get("scheme", "http") + "://" + server_host + full_path
+    server_host, port, http_url = get_host_port_url_tuple(scope)
     query_string = scope.get("query_string")
     if query_string and http_url:
         if isinstance(query_string, bytes):
@@ -71,10 +77,9 @@ def collect_request_attributes(scope):
         http_url = http_url + ("?" + urllib.parse.unquote(query_string))
 
     result = {
-        "component": scope["type"],
         "http.scheme": scope.get("scheme"),
         "http.host": server_host,
-        "host.port": port,
+        "net.host.port": port,
         "http.flavor": scope.get("http_version"),
         "http.target": scope.get("path"),
         "http.url": http_url,
@@ -82,11 +87,12 @@ def collect_request_attributes(scope):
     http_method = scope.get("method")
     if http_method:
         result["http.method"] = http_method
-    http_host_value = ",".join(carrier_getter.get(scope, "host"))
-    if http_host_value:
-        result["http.server_name"] = http_host_value
+
+    http_host_value_list = carrier_getter.get(scope, "host")
+    if http_host_value_list:
+        result["http.server_name"] = ",".join(http_host_value_list)
     http_user_agent = carrier_getter.get(scope, "user-agent")
-    if len(http_user_agent) > 0:
+    if http_user_agent:
         result["http.user_agent"] = http_user_agent[0]
 
     if "client" in scope and scope["client"] is not None:
@@ -97,6 +103,17 @@ def collect_request_attributes(scope):
     result = {k: v for k, v in result.items() if v is not None}
 
     return result
+
+
+def get_host_port_url_tuple(scope):
+    """Returns (host, port, full_url) tuple.
+    """
+    server = scope.get("server") or ["0.0.0.0", 80]
+    port = server[1]
+    server_host = server[0] + (":" + str(port) if port != 80 else "")
+    full_path = scope.get("root_path", "") + scope.get("path", "")
+    http_url = scope.get("scheme", "http") + "://" + server_host + full_path
+    return server_host, port, http_url
 
 
 def set_status_code(span, status_code):
@@ -146,12 +163,13 @@ class OpenTelemetryMiddleware:
             Optional: Defaults to get_default_span_details.
     """
 
-    def __init__(self, app, span_details_callback=None):
+    def __init__(self, app, excluded_urls=None, span_details_callback=None):
         self.app = guarantee_single_callable(app)
         self.tracer = trace.get_tracer(__name__, __version__)
         self.span_details_callback = (
             span_details_callback or get_default_span_details
         )
+        self.excluded_urls = excluded_urls
 
     async def __call__(self, scope, receive, send):
         """The ASGI application
@@ -164,7 +182,11 @@ class OpenTelemetryMiddleware:
         if scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
 
-        token = context.attach(propagators.extract(carrier_getter, scope))
+        _, _, url = get_host_port_url_tuple(scope)
+        if self.excluded_urls and self.excluded_urls.url_disabled(url):
+            return await self.app(scope, receive, send)
+
+        token = context.attach(extract(carrier_getter, scope))
         span_name, additional_attributes = self.span_details_callback(scope)
 
         try:

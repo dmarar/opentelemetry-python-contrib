@@ -28,6 +28,13 @@ from opentelemetry.instrumentation.grpc import (
 )
 from opentelemetry.sdk import trace as trace_sdk
 from opentelemetry.test.test_base import TestBase
+from opentelemetry.trace.status import StatusCode
+
+from .protobuf.test_server_pb2 import Request, Response
+from .protobuf.test_server_pb2_grpc import (
+    GRPCTestServerServicer,
+    add_GRPCTestServerServicer_to_server,
+)
 
 
 class UnaryUnaryMethodHandler(grpc.RpcMethodHandler):
@@ -50,6 +57,23 @@ class UnaryUnaryRpcHandler(grpc.GenericRpcHandler):
         return UnaryUnaryMethodHandler(self._unary_unary_handler)
 
 
+class Servicer(GRPCTestServerServicer):
+    """Our test servicer"""
+
+    # pylint:disable=C0103
+    def SimpleMethod(self, request, context):
+        return Response(
+            server_id=request.client_id, response_data=request.request_data,
+        )
+
+    # pylint:disable=C0103
+    def ServerStreamingMethod(self, request, context):
+        for data in ("one", "two", "three"):
+            yield Response(
+                server_id=request.client_id, response_data=data,
+            )
+
+
 class TestOpenTelemetryServerInterceptor(TestBase):
     def test_instrumentor(self):
         def handler(request, context):
@@ -67,20 +91,37 @@ class TestOpenTelemetryServerInterceptor(TestBase):
         port = server.add_insecure_port("[::]:0")
         channel = grpc.insecure_channel("localhost:{:d}".format(port))
 
+        rpc_call = "TestServicer/handler"
         try:
             server.start()
-            channel.unary_unary("test")(b"test")
+            channel.unary_unary(rpc_call)(b"test")
         finally:
             server.stop(None)
 
         spans_list = self.memory_exporter.get_finished_spans()
         self.assertEqual(len(spans_list), 1)
         span = spans_list[0]
-        self.assertEqual(span.name, "test")
+        self.assertEqual(span.name, rpc_call)
         self.assertIs(span.kind, trace.SpanKind.SERVER)
+
+        # Check version and name in span's instrumentation info
         self.check_span_instrumentation_info(
             span, opentelemetry.instrumentation.grpc
         )
+
+        # Check attributes
+        self.assert_span_has_attributes(
+            span,
+            {
+                "net.peer.ip": "[::1]",
+                "net.peer.name": "localhost",
+                "rpc.method": "handler",
+                "rpc.service": "TestServicer",
+                "rpc.system": "grpc",
+                "rpc.grpc.status_code": grpc.StatusCode.OK.value[0],
+            },
+        )
+
         grpc_server_instrumentor.uninstrument()
 
     def test_uninstrument(self):
@@ -100,9 +141,10 @@ class TestOpenTelemetryServerInterceptor(TestBase):
         port = server.add_insecure_port("[::]:0")
         channel = grpc.insecure_channel("localhost:{:d}".format(port))
 
+        rpc_call = "TestServicer/test"
         try:
             server.start()
-            channel.unary_unary("test")(b"test")
+            channel.unary_unary(rpc_call)(b"test")
         finally:
             server.stop(None)
 
@@ -115,24 +157,21 @@ class TestOpenTelemetryServerInterceptor(TestBase):
         # Intercept gRPC calls...
         interceptor = server_interceptor()
 
-        # No-op RPC handler
-        def handler(request, context):
-            return b""
-
         server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=1),
             options=(("grpc.so_reuseport", 0),),
             interceptors=[interceptor],
         )
-
-        server.add_generic_rpc_handlers((UnaryUnaryRpcHandler(handler),))
-
+        add_GRPCTestServerServicer_to_server(Servicer(), server)
         port = server.add_insecure_port("[::]:0")
         channel = grpc.insecure_channel("localhost:{:d}".format(port))
 
+        rpc_call = "/GRPCTestServer/SimpleMethod"
+        request = Request(client_id=1, request_data="test")
+        msg = request.SerializeToString()
         try:
             server.start()
-            channel.unary_unary("")(b"")
+            channel.unary_unary(rpc_call)(msg)
         finally:
             server.stop(None)
 
@@ -140,12 +179,223 @@ class TestOpenTelemetryServerInterceptor(TestBase):
         self.assertEqual(len(spans_list), 1)
         span = spans_list[0]
 
-        self.assertEqual(span.name, "")
+        self.assertEqual(span.name, rpc_call)
         self.assertIs(span.kind, trace.SpanKind.SERVER)
 
         # Check version and name in span's instrumentation info
         self.check_span_instrumentation_info(
             span, opentelemetry.instrumentation.grpc
+        )
+
+        # Check attributes
+        self.assert_span_has_attributes(
+            span,
+            {
+                "net.peer.ip": "[::1]",
+                "net.peer.name": "localhost",
+                "rpc.method": "SimpleMethod",
+                "rpc.service": "GRPCTestServer",
+                "rpc.system": "grpc",
+                "rpc.grpc.status_code": grpc.StatusCode.OK.value[0],
+            },
+        )
+
+    def test_create_two_spans(self):
+        """Verify that the interceptor captures sub spans within the given
+        trace"""
+
+        class TwoSpanServicer(GRPCTestServerServicer):
+            # pylint:disable=C0103
+            def SimpleMethod(self, request, context):
+
+                # create another span
+                tracer = trace.get_tracer(__name__)
+                with tracer.start_as_current_span("child") as child:
+                    child.add_event("child event")
+
+                return Response(
+                    server_id=request.client_id,
+                    response_data=request.request_data,
+                )
+
+        # Intercept gRPC calls...
+        interceptor = server_interceptor()
+
+        # setup the server
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=1),
+            options=(("grpc.so_reuseport", 0),),
+            interceptors=[interceptor],
+        )
+        add_GRPCTestServerServicer_to_server(TwoSpanServicer(), server)
+        port = server.add_insecure_port("[::]:0")
+        channel = grpc.insecure_channel("localhost:{:d}".format(port))
+
+        # setup the RPC
+        rpc_call = "/GRPCTestServer/SimpleMethod"
+        request = Request(client_id=1, request_data="test")
+        msg = request.SerializeToString()
+        try:
+            server.start()
+            channel.unary_unary(rpc_call)(msg)
+        finally:
+            server.stop(None)
+
+        spans_list = self.memory_exporter.get_finished_spans()
+        self.assertEqual(len(spans_list), 2)
+        child_span = spans_list[0]
+        parent_span = spans_list[1]
+
+        self.assertEqual(parent_span.name, rpc_call)
+        self.assertIs(parent_span.kind, trace.SpanKind.SERVER)
+
+        # Check version and name in span's instrumentation info
+        self.check_span_instrumentation_info(
+            parent_span, opentelemetry.instrumentation.grpc
+        )
+
+        # Check attributes
+        self.assert_span_has_attributes(
+            parent_span,
+            {
+                "net.peer.ip": "[::1]",
+                "net.peer.name": "localhost",
+                "rpc.method": "SimpleMethod",
+                "rpc.service": "GRPCTestServer",
+                "rpc.system": "grpc",
+                "rpc.grpc.status_code": grpc.StatusCode.OK.value[0],
+            },
+        )
+
+        # Check the child span
+        self.assertEqual(child_span.name, "child")
+        self.assertEqual(
+            parent_span.context.trace_id, child_span.context.trace_id
+        )
+
+    def test_create_span_streaming(self):
+        """Check that the interceptor wraps calls with spans server-side, on a
+        streaming call."""
+
+        # Intercept gRPC calls...
+        interceptor = server_interceptor()
+
+        # setup the server
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=1),
+            options=(("grpc.so_reuseport", 0),),
+            interceptors=[interceptor],
+        )
+        add_GRPCTestServerServicer_to_server(Servicer(), server)
+        port = server.add_insecure_port("[::]:0")
+        channel = grpc.insecure_channel("localhost:{:d}".format(port))
+
+        # setup the RPC
+        rpc_call = "/GRPCTestServer/ServerStreamingMethod"
+        request = Request(client_id=1, request_data="test")
+        msg = request.SerializeToString()
+        try:
+            server.start()
+            list(channel.unary_stream(rpc_call)(msg))
+        finally:
+            server.stop(None)
+
+        spans_list = self.memory_exporter.get_finished_spans()
+        self.assertEqual(len(spans_list), 1)
+        span = spans_list[0]
+
+        self.assertEqual(span.name, rpc_call)
+        self.assertIs(span.kind, trace.SpanKind.SERVER)
+
+        # Check version and name in span's instrumentation info
+        self.check_span_instrumentation_info(
+            span, opentelemetry.instrumentation.grpc
+        )
+
+        # Check attributes
+        self.assert_span_has_attributes(
+            span,
+            {
+                "net.peer.ip": "[::1]",
+                "net.peer.name": "localhost",
+                "rpc.method": "ServerStreamingMethod",
+                "rpc.service": "GRPCTestServer",
+                "rpc.system": "grpc",
+                "rpc.grpc.status_code": grpc.StatusCode.OK.value[0],
+            },
+        )
+
+    def test_create_two_spans_streaming(self):
+        """Verify that the interceptor captures sub spans in a
+        streaming call, within the given trace"""
+
+        class TwoSpanServicer(GRPCTestServerServicer):
+            # pylint:disable=C0103
+            def ServerStreamingMethod(self, request, context):
+
+                # create another span
+                tracer = trace.get_tracer(__name__)
+                with tracer.start_as_current_span("child") as child:
+                    child.add_event("child event")
+
+                for data in ("one", "two", "three"):
+                    yield Response(
+                        server_id=request.client_id, response_data=data,
+                    )
+
+        # Intercept gRPC calls...
+        interceptor = server_interceptor()
+
+        # setup the server
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=1),
+            options=(("grpc.so_reuseport", 0),),
+            interceptors=[interceptor],
+        )
+        add_GRPCTestServerServicer_to_server(TwoSpanServicer(), server)
+        port = server.add_insecure_port("[::]:0")
+        channel = grpc.insecure_channel("localhost:{:d}".format(port))
+
+        # setup the RPC
+        rpc_call = "/GRPCTestServer/ServerStreamingMethod"
+        request = Request(client_id=1, request_data="test")
+        msg = request.SerializeToString()
+        try:
+            server.start()
+            list(channel.unary_stream(rpc_call)(msg))
+        finally:
+            server.stop(None)
+
+        spans_list = self.memory_exporter.get_finished_spans()
+        self.assertEqual(len(spans_list), 2)
+        child_span = spans_list[0]
+        parent_span = spans_list[1]
+
+        self.assertEqual(parent_span.name, rpc_call)
+        self.assertIs(parent_span.kind, trace.SpanKind.SERVER)
+
+        # Check version and name in span's instrumentation info
+        self.check_span_instrumentation_info(
+            parent_span, opentelemetry.instrumentation.grpc
+        )
+
+        # Check attributes
+        self.assert_span_has_attributes(
+            parent_span,
+            {
+                "net.peer.ip": "[::1]",
+                "net.peer.name": "localhost",
+                "rpc.method": "ServerStreamingMethod",
+                "rpc.service": "GRPCTestServer",
+                "rpc.system": "grpc",
+                "rpc.grpc.status_code": grpc.StatusCode.OK.value[0],
+            },
+        )
+
+        # Check the child span
+        self.assertEqual(child_span.name, "child")
+        self.assertEqual(
+            parent_span.context.trace_id, child_span.context.trace_id
         )
 
     def test_span_lifetime(self):
@@ -174,7 +424,7 @@ class TestOpenTelemetryServerInterceptor(TestBase):
         active_span_before_call = trace.get_current_span()
         try:
             server.start()
-            channel.unary_unary("")(b"")
+            channel.unary_unary("TestServicer/handler")(b"")
         finally:
             server.stop(None)
         active_span_after_call = trace.get_current_span()
@@ -208,20 +458,34 @@ class TestOpenTelemetryServerInterceptor(TestBase):
 
         try:
             server.start()
-            channel.unary_unary("")(b"")
-            channel.unary_unary("")(b"")
+            channel.unary_unary("TestServicer/handler")(b"")
+            channel.unary_unary("TestServicer/handler")(b"")
         finally:
             server.stop(None)
 
         self.assertEqual(len(active_spans_in_handler), 2)
         # pylint:disable=unbalanced-tuple-unpacking
         span1, span2 = active_spans_in_handler
-        # Spans should belong to separate traces, and each should be a root
-        # span
+        # Spans should belong to separate traces
         self.assertNotEqual(span1.context.span_id, span2.context.span_id)
         self.assertNotEqual(span1.context.trace_id, span2.context.trace_id)
-        self.assertIsNone(span1.parent)
-        self.assertIsNone(span1.parent)
+
+        for span in (span1, span2):
+            # each should be a root span
+            self.assertIsNone(span2.parent)
+
+            # check attributes
+            self.assert_span_has_attributes(
+                span,
+                {
+                    "net.peer.ip": "[::1]",
+                    "net.peer.name": "localhost",
+                    "rpc.method": "handler",
+                    "rpc.service": "TestServicer",
+                    "rpc.system": "grpc",
+                    "rpc.grpc.status_code": grpc.StatusCode.OK.value[0],
+                },
+            )
 
     def test_concurrent_server_spans(self):
         """Check that concurrent RPC calls don't interfere with each other.
@@ -258,8 +522,12 @@ class TestOpenTelemetryServerInterceptor(TestBase):
             # Interleave calls so spans are active on each thread at the same
             # time
             with futures.ThreadPoolExecutor(max_workers=2) as tpe:
-                f1 = tpe.submit(channel.unary_unary(""), b"")
-                f2 = tpe.submit(channel.unary_unary(""), b"")
+                f1 = tpe.submit(
+                    channel.unary_unary("TestServicer/handler"), b""
+                )
+                f2 = tpe.submit(
+                    channel.unary_unary("TestServicer/handler"), b""
+                )
             futures.wait((f1, f2))
         finally:
             server.stop(None)
@@ -267,12 +535,94 @@ class TestOpenTelemetryServerInterceptor(TestBase):
         self.assertEqual(len(active_spans_in_handler), 2)
         # pylint:disable=unbalanced-tuple-unpacking
         span1, span2 = active_spans_in_handler
-        # Spans should belong to separate traces, and each should be a root
-        # span
+        # Spans should belong to separate traces
         self.assertNotEqual(span1.context.span_id, span2.context.span_id)
         self.assertNotEqual(span1.context.trace_id, span2.context.trace_id)
-        self.assertIsNone(span1.parent)
-        self.assertIsNone(span1.parent)
+
+        for span in (span1, span2):
+            # each should be a root span
+            self.assertIsNone(span2.parent)
+
+            # check attributes
+            self.assert_span_has_attributes(
+                span,
+                {
+                    "net.peer.ip": "[::1]",
+                    "net.peer.name": "localhost",
+                    "rpc.method": "handler",
+                    "rpc.service": "TestServicer",
+                    "rpc.system": "grpc",
+                    "rpc.grpc.status_code": grpc.StatusCode.OK.value[0],
+                },
+            )
+
+    def test_abort(self):
+        """Check that we can catch an abort properly"""
+
+        # Intercept gRPC calls...
+        interceptor = server_interceptor()
+
+        # our detailed failure message
+        failure_message = "This is a test failure"
+
+        # aborting RPC handler
+        def handler(request, context):
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, failure_message)
+
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=1),
+            options=(("grpc.so_reuseport", 0),),
+            interceptors=[interceptor],
+        )
+
+        server.add_generic_rpc_handlers((UnaryUnaryRpcHandler(handler),))
+
+        port = server.add_insecure_port("[::]:0")
+        channel = grpc.insecure_channel("localhost:{:d}".format(port))
+
+        rpc_call = "TestServicer/handler"
+
+        server.start()
+        # unfortunately, these are just bare exceptions in grpc...
+        with self.assertRaises(Exception):
+            channel.unary_unary(rpc_call)(b"")
+        server.stop(None)
+
+        spans_list = self.memory_exporter.get_finished_spans()
+        self.assertEqual(len(spans_list), 1)
+        span = spans_list[0]
+
+        self.assertEqual(span.name, rpc_call)
+        self.assertIs(span.kind, trace.SpanKind.SERVER)
+
+        # Check version and name in span's instrumentation info
+        self.check_span_instrumentation_info(
+            span, opentelemetry.instrumentation.grpc
+        )
+
+        # make sure this span errored, with the right status and detail
+        self.assertEqual(span.status.status_code, StatusCode.ERROR)
+        self.assertEqual(
+            span.status.description,
+            "{}:{}".format(
+                grpc.StatusCode.FAILED_PRECONDITION, failure_message
+            ),
+        )
+
+        # Check attributes
+        self.assert_span_has_attributes(
+            span,
+            {
+                "net.peer.ip": "[::1]",
+                "net.peer.name": "localhost",
+                "rpc.method": "handler",
+                "rpc.service": "TestServicer",
+                "rpc.system": "grpc",
+                "rpc.grpc.status_code": grpc.StatusCode.FAILED_PRECONDITION.value[
+                    0
+                ],
+            },
+        )
 
 
 def get_latch(num):

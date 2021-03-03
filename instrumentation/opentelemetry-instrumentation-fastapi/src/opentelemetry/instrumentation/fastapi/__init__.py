@@ -11,14 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
 
 import fastapi
 from starlette.routing import Match
 
 from opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware
-from opentelemetry.instrumentation.fastapi.version import __version__  # noqa
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
+from opentelemetry.util.http import get_excluded_urls
+
+_excluded_urls = get_excluded_urls("FASTAPI")
 
 
 class FastAPIInstrumentor(BaseInstrumentor):
@@ -36,6 +37,7 @@ class FastAPIInstrumentor(BaseInstrumentor):
         if not getattr(app, "is_instrumented_by_opentelemetry", False):
             app.add_middleware(
                 OpenTelemetryMiddleware,
+                excluded_urls=_excluded_urls,
                 span_details_callback=_get_route_details,
             )
             app.is_instrumented_by_opentelemetry = True
@@ -52,7 +54,9 @@ class _InstrumentedFastAPI(fastapi.FastAPI):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.add_middleware(
-            OpenTelemetryMiddleware, span_details_callback=_get_route_details
+            OpenTelemetryMiddleware,
+            excluded_urls=_excluded_urls,
+            span_details_callback=_get_route_details,
         )
 
 

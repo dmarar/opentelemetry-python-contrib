@@ -134,10 +134,9 @@ class TestAsgiApplication(AsgiTestBase):
                 "name": "GET asgi",
                 "kind": trace_api.SpanKind.SERVER,
                 "attributes": {
-                    "component": "http",
                     "http.method": "GET",
                     "http.scheme": "http",
-                    "host.port": 80,
+                    "net.host.port": 80,
                     "http.host": "127.0.0.1",
                     "http.flavor": "1.0",
                     "http.target": "/",
@@ -164,7 +163,7 @@ class TestAsgiApplication(AsgiTestBase):
         outputs = self.get_all_output()
         self.validate_outputs(outputs)
 
-    def test_wsgi_not_recording(self):
+    def test_asgi_not_recording(self):
         mock_tracer = mock.Mock()
         mock_span = mock.Mock()
         mock_span.is_recording.return_value = False
@@ -218,7 +217,7 @@ class TestAsgiApplication(AsgiTestBase):
             expected[3]["attributes"].update(
                 {
                     "http.host": "0.0.0.0",
-                    "host.port": 80,
+                    "net.host.port": 80,
                     "http.url": "http://0.0.0.0/",
                 }
             )
@@ -312,18 +311,22 @@ class TestAsgiAttributes(unittest.TestCase):
 
     def test_request_attributes(self):
         self.scope["query_string"] = b"foo=bar"
+        headers = []
+        headers.append(("host".encode("utf8"), "test".encode("utf8")))
+        self.scope["headers"] = headers
 
         attrs = otel_asgi.collect_request_attributes(self.scope)
+
         self.assertDictEqual(
             attrs,
             {
-                "component": "http",
                 "http.method": "GET",
                 "http.host": "127.0.0.1",
                 "http.target": "/",
                 "http.url": "http://127.0.0.1/?foo=bar",
-                "host.port": 80,
+                "net.host.port": 80,
                 "http.scheme": "http",
+                "http.server_name": "test",
                 "http.flavor": "1.0",
                 "net.peer.ip": "127.0.0.1",
                 "net.peer.port": 32767,

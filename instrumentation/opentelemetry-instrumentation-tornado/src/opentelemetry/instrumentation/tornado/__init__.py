@@ -35,18 +35,15 @@ Usage
     tornado.ioloop.IOLoop.current().start()
 """
 
-import inspect
-import typing
 from collections import namedtuple
-from functools import partial, wraps
+from functools import partial
 from logging import getLogger
 
 import tornado.web
 import wrapt
-from tornado.routing import Rule
 from wrapt import wrap_function_wrapper
 
-from opentelemetry import configuration, context, propagators, trace
+from opentelemetry import context, trace
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.tornado.version import __version__
 from opentelemetry.instrumentation.utils import (
@@ -54,9 +51,11 @@ from opentelemetry.instrumentation.utils import (
     http_status_to_status_code,
     unwrap,
 )
-from opentelemetry.trace.propagation.textmap import DictGetter
+from opentelemetry.propagate import extract
+from opentelemetry.propagators.textmap import DictGetter
 from opentelemetry.trace.status import Status
-from opentelemetry.util import ExcludeList, time_ns
+from opentelemetry.util.http import get_excluded_urls, get_traced_request_attrs
+from opentelemetry.util.time import time_ns
 
 from .client import fetch_async  # pylint: disable=E0401
 
@@ -66,25 +65,8 @@ _HANDLER_CONTEXT_KEY = "_otel_trace_context_key"
 _OTEL_PATCHED_KEY = "_otel_patched_key"
 
 
-def get_excluded_urls():
-    urls = configuration.Configuration().TORNADO_EXCLUDED_URLS or ""
-    if urls:
-        urls = str.split(urls, ",")
-    return ExcludeList(urls)
-
-
-def get_traced_request_attrs():
-    attrs = configuration.Configuration().TORNADO_TRACED_REQUEST_ATTRS or ""
-    if attrs:
-        attrs = [attr.strip() for attr in attrs.split(",")]
-    else:
-        attrs = []
-    return attrs
-
-
-_excluded_urls = get_excluded_urls()
-_traced_attrs = get_traced_request_attrs()
-
+_excluded_urls = get_excluded_urls("TORNADO")
+_traced_request_attrs = get_traced_request_attrs("TORNADO")
 carrier_getter = DictGetter()
 
 
@@ -190,7 +172,6 @@ def _log_exception(tracer, func, handler, args, kwargs):
 
 def _get_attributes_from_request(request):
     attrs = {
-        "component": "tornado",
         "http.method": request.method,
         "http.scheme": request.protocol,
         "http.host": request.host,
@@ -203,7 +184,9 @@ def _get_attributes_from_request(request):
     if request.remote_ip:
         attrs["net.peer.ip"] = request.remote_ip
 
-    return extract_attributes_from_object(request, _traced_attrs, attrs)
+    return extract_attributes_from_object(
+        request, _traced_request_attrs, attrs
+    )
 
 
 def _get_operation_name(handler, request):
@@ -213,9 +196,7 @@ def _get_operation_name(handler, request):
 
 
 def _start_span(tracer, handler, start_time) -> _TraceContext:
-    token = context.attach(
-        propagators.extract(carrier_getter, handler.request.headers,)
-    )
+    token = context.attach(extract(carrier_getter, handler.request.headers,))
 
     span = tracer.start_span(
         _get_operation_name(handler, handler.request),
